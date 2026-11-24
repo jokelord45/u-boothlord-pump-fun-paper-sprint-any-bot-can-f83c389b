@@ -14,16 +14,21 @@ import { createHash } from 'node:crypto';
 import { BotState, type Batch, type Fill, type Hello, type Mark, type Order } from '../vendor/agentfun-bot.ts';
 import { createStrategy, DEFAULT_PARAMS, type Params } from '../strategy.ts';
 
+/** Curve reserves for one mint, virtual + real. */
 interface CurveState {
   vq: bigint;
   vt: bigint;
   rq: bigint;
   rt: bigint;
 }
+
+/** The bot's own persistent displacement of a curve (self-impact). */
 interface Offset {
   quote: bigint;
   tokens: bigint;
 }
+
+/** Per-mint replay state. */
 interface MintRt {
   state: CurveState;
   stateSlot: number;
@@ -32,6 +37,8 @@ interface MintRt {
   complete: boolean;
   offset: Offset;
 }
+
+/** An order waiting for its fill slot. */
 interface Pending {
   order: Order;
   seq: number;
@@ -45,23 +52,28 @@ interface Pending {
 const BPS = 10_000n;
 const MASK = (1n << 64n) - 1n;
 const GAMMA = 0x9e3779b97f4a7c15n;
+
+/** SplitMix64-style mixer used for the seeded failure draw. */
 function mix64(z0: bigint): bigint {
   let z = z0 & MASK;
   z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK;
   z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & MASK;
   return z ^ (z >> 31n);
 }
+
 function keyed(seed: bigint, ...parts: bigint[]): bigint {
   let h = mix64((seed + GAMMA) & MASK);
   for (const p of parts) h = mix64((h ^ (p & MASK)) + GAMMA);
   return h;
 }
+
 const FAILED_TX = 0x6661696c65642d74n;
 const PUBLIC_FAIL_KEY = 0x6661696c2d6b6579n;
 
 const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
 const feeOf = (amount: bigint, bps: bigint) => ceilDiv(amount * bps, BPS);
 
+/** Apply the bot's own offset to a curve, scaled down if the offset would drain it. */
 function offsetReserves(r: CurveState, off: Offset): CurveState {
   let num = 1n;
   let den = 1n;
@@ -79,6 +91,7 @@ function offsetReserves(r: CurveState, off: Offset): CurveState {
   return { vq: r.vq + q, rq: r.rq + q, vt: r.vt - t, rt: r.rt - t };
 }
 
+/** Quote a buy of `spend` lamports against curve `s` with protocol fee `p` and creator fee `c`. */
 function quoteBuy(spend: bigint, s: CurveState, p: bigint, c: bigint) {
   const net0 = (spend * BPS) / (BPS + p + c);
   const fee = feeOf(net0, p);
@@ -96,6 +109,8 @@ function quoteBuy(spend: bigint, s: CurveState, p: bigint, c: bigint) {
   }
   return { q, t, fee, cf, paid: q + fee + cf };
 }
+
+/** Quote a sell of `t` tokens against curve `s` with protocol fee `p` and creator fee `c`. */
 function quoteSell(t: bigint, s: CurveState, p: bigint, c: bigint) {
   const q = (t * s.vq) / (s.vt + t);
   const fee = feeOf(q, p);
@@ -116,12 +131,19 @@ export interface SimResult {
   log: string[];
 }
 
+/** Kit dataset cache, keyed by kit directory. */
 const cache = new Map<string, { manifest: any; events: any[] }>();
+
 function load(kit: string) {
   let c = cache.get(kit);
   if (c === undefined) {
-    const raw = ['part-00000','part-00001','part-00002'].map((f) => gunzipSync(readFileSync(`${kit}/dataset/events/${f}.ndjson.gz`)).toString('utf8')).join('');
-    c = { manifest: JSON.parse(readFileSync(`${kit}/dataset/manifest.json`, 'utf8')), events: raw.split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l)) };
+    const raw = ['part-00000', 'part-00001', 'part-00002']
+      .map((f) => gunzipSync(readFileSync(`${kit}/dataset/events/${f}.ndjson.gz`)).toString('utf8'))
+      .join('');
+    c = {
+      manifest: JSON.parse(readFileSync(`${kit}/dataset/manifest.json`, 'utf8')),
+      events: raw.split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l)),
+    };
     cache.set(kit, c);
   }
   return c;
@@ -130,6 +152,7 @@ function load(kit: string) {
 export function simulate(kit: string, params: Params, verbose = false): SimResult {
   const { manifest, events } = load(kit);
   const sample = manifest.universe.sample;
+  // The sampled universe: only mints whose sha256 hash lands in the sample residue.
   const universe = new Set<string>();
   for (const e of events) {
     if (e.event !== 'CreateEvent') continue;
@@ -137,6 +160,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
     const h = BigInt(`0x${createHash('sha256').update(e.mint, 'utf8').digest('hex')}`);
     if (h % BigInt(sample.modulus) === BigInt(sample.residue)) universe.add(e.mint);
   }
+  // Group the sampled events into one batch per slot, in file order.
   const batches: { slot: number; events: any[] }[] = [];
   for (const e of events) {
     if (!universe.has(e.mint)) continue;
@@ -174,12 +198,15 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
   const spent = { seq: -1, byMint: new Map<string, bigint>() };
   let peak = 0n;
   let maxDD = 0;
+
   const addPnl = (mint: string, d: bigint) => perMint.set(mint, (perMint.get(mint) ?? 0n) + d);
   const reserves = (m: MintRt) => offsetReserves(m.state, m.offset);
+  /** Fee schedule for a landing trade: the trade's own bps, else the 95/30 fallback. */
   const feesFor = (landing: any | null) =>
     landing !== null && BigInt(landing.fee_basis_points) > 0n
       ? { p: BigInt(landing.fee_basis_points), c: BigInt(landing.creator_fee_basis_points), fallback: false }
       : { p: 95n, c: 30n, fallback: true };
+
   const fillBase = (p: Pending): Fill => ({
     client_id: p.order.client_id,
     mint: p.order.mint,
@@ -201,6 +228,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
   const openCount = () => positions.size;
   const failedDraw = (p: Pending) => keyed(failKey, FAILED_TX, BigInt(p.seq), BigInt(p.index)) % 10_000n < 200n;
 
+  /** Resolve one pending order at its fill slot: checks, failure draw, then settle. */
   const resolve = (p: Pending, curSlot: number) => {
     if (p.reject !== null) return reject(p, p.reject);
     const m = mints.get(p.order.mint)!;
@@ -290,6 +318,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
     });
   };
 
+  /** What a forced close of `tokens` would net (after fees and one tx fee). */
   const closeQuote = (m: MintRt, tokens: bigint) => {
     const s = reserves(m);
     const bps = feesFor(m.lastTrade);
@@ -298,6 +327,8 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
     const proceeds = q - feeOf(q, bps.p) - feeOf(q, bps.c);
     return { q, proceeds, net: proceeds - txFee, abandon: proceeds - txFee <= 0n };
   };
+
+  /** Force-close a position (token completed, or flatten at the end of the window). */
   const forceClose = (mint: string, why: string, slot: number) => {
     const pos = positions.get(mint)!;
     const m = mints.get(mint)!;
@@ -325,6 +356,8 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
       fee_fallback: false,
     });
   };
+
+  /** Mark-to-market equity: cash plus forced-close value of every open position. */
   const equity = () => {
     let e = cash;
     for (const [mint, p] of positions) {
@@ -333,6 +366,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
     }
     return e;
   };
+
   const track = (e: bigint) => {
     if (e > peak) peak = e;
     if (peak > 0n) {
@@ -340,6 +374,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
       if (dd > maxDD) maxDD = dd;
     }
   };
+
   const account = () => ({
     cash_lamports: cash.toString(),
     positions: [...positions.entries()]
@@ -351,12 +386,18 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
   const strategy = createStrategy(params);
   track(cash);
   let seq = 0;
-  for (const b of batches) {
-    const x = b.slot;
-    while (pending.length > 0 && pending[0]!.fillSlot < x) {
+  /** Resolve every pending order whose fill slot has arrived: strictly before `slot`,
+   * or on `slot` itself when `inclusive` is set. Each fill resolves at its own fill slot. */
+  const drainDue = (slot: number, inclusive: boolean) => {
+    while (pending.length > 0 && (inclusive ? pending[0]!.fillSlot <= slot : pending[0]!.fillSlot < slot)) {
       const p = pending.shift()!;
       resolve(p, p.fillSlot);
     }
+  };
+  for (const b of batches) {
+    const x = b.slot;
+    // Fills due before this slot resolve first.
+    drainDue(x, false);
     const completed: string[] = [];
     for (const e of b.events) {
       if (e.event === 'CreateEvent') {
@@ -379,8 +420,10 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
         completed.push(e.mint);
       }
     }
+    // Tokens that completed this slot close out immediately.
     for (const mint of completed) if (positions.has(mint)) forceClose(mint, 'complete', x);
-    while (pending.length > 0 && pending[0]!.fillSlot === x) resolve(pending.shift()!, x);
+    // Fills landing exactly on this slot resolve before the bot decides.
+    drainDue(x, true);
     const want = new Set<string>(positions.keys());
     for (const p of pending) if (mints.has(p.order.mint)) want.add(p.order.mint);
     const marks: Mark[] = [...want].sort().map((mint) => {
@@ -407,6 +450,7 @@ export function simulate(kit: string, params: Params, verbose = false): SimResul
     });
     seq++;
   }
+  // Drain whatever is still pending, then flatten every open position.
   while (pending.length > 0) {
     const p = pending.shift()!;
     if (p.fillSlot > endSlot) reject(p, 'after_end');
