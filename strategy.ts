@@ -328,6 +328,55 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     return false;
   }
 
+  /** Expected coin count at the current pace: targetCoins prorated over
+   * paceSeconds of block time since the first event, capped at the target.
+   * The pace fraction never exceeds 1, so once the full window has elapsed
+   * the target is simply targetCoins and no further probe can be justified
+   * by the clock alone. */
+  function paceTarget(): number {
+    if (firstTime === null) return 0;
+    const pace = Math.min(1, (nowTime - firstTime) / P.paceSeconds);
+    return Math.ceil(P.targetCoins * pace);
+  }
+
+  /** True when a probe round trip is allowed this batch: a probe slot is
+   * free, an open-position slot is free, the window has started, and the
+   * bot's own coin count lags the prorated pace target. On a busy window
+   * the count keeps up on real entries alone, so this stays false and no
+   * probe ever fires. */
+  function shouldProbe(state: BotState, openPositions: number): boolean {
+    if (probes.size >= P.maxProbes) return false;
+    if (openPositions >= state.hello.caps.max_open_positions) return false;
+    if (firstTime === null) return false;
+    return myCoins.size < paceTarget();
+  }
+
+  /** Most liquid coin trading this batch that the bot does not already hold,
+   * probe, or have a buy pending for, and whose real SOL reserve clears the
+   * probe's minimum size (1.5x the reserve a max-size probe order needs, so
+   * the probe buy stays well inside the per-order reserve cap). Returns
+   * null when no coin trading this batch qualifies. */
+  function pickProbeMint(state: BotState, batch: Batch): Pubkey | null {
+    const minRq = (BigInt(P.probeLamports) * BPS) / BigInt(state.hello.caps.max_order_bps_of_real_reserve);
+    let best: Pubkey | null = null;
+    let bestRq = 0n;
+    for (const e of batch.events) {
+      if (e.event !== 'TradeEvent') continue;
+      const mint = e.mint;
+      if (coins.get(mint)?.done) continue;
+      if (state.positions.has(mint) || probes.has(mint) || hasPendingBuy(state, mint)) continue;
+      const curve = state.curves.get(mint);
+      if (curve === undefined || curve.complete) continue;
+      const rq = curve.real_quote_reserves;
+      if (rq < minRq * 3n / 2n) continue;
+      if (rq > bestRq) {
+        bestRq = rq;
+        best = mint;
+      }
+    }
+    return best;
+  }
+
   return {
     onBatch(state, batch) {
       readEvents(batch);
@@ -455,31 +504,11 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       }
 
       // Guardrail pacing: open a probe when the bot's coin count lags the pace.
-      if (probes.size < P.maxProbes && open < state.hello.caps.max_open_positions && firstTime !== null) {
-        const pace = Math.min(1, (nowTime - firstTime) / P.paceSeconds);
-        if (myCoins.size < Math.ceil(P.targetCoins * pace)) {
-          const minRq = (BigInt(P.probeLamports) * BPS) / BigInt(state.hello.caps.max_order_bps_of_real_reserve);
-          // Most liquid coin trading this batch that we do not already hold.
-          let best: Pubkey | null = null;
-          let bestRq = 0n;
-          for (const e of batch.events) {
-            if (e.event !== 'TradeEvent') continue;
-            const mint = e.mint;
-            if (coins.get(mint)?.done) continue;
-            if (state.positions.has(mint) || probes.has(mint) || hasPendingBuy(state, mint)) continue;
-            const curve = state.curves.get(mint);
-            if (curve === undefined || curve.complete) continue;
-            const rq = curve.real_quote_reserves;
-            if (rq < minRq * 3n / 2n) continue;
-            if (rq > bestRq) {
-              bestRq = rq;
-              best = mint;
-            }
-          }
-          if (best !== null && free >= BigInt(P.probeLamports) + tx) {
-            orders.push({ side: 'buy', mint: best, quote_lamports: BigInt(P.probeLamports), max_slippage_bps: P.buySlippageBps });
-            probes.set(best, false);
-          }
+      if (shouldProbe(state, open)) {
+        const best = pickProbeMint(state, batch);
+        if (best !== null && free >= BigInt(P.probeLamports) + tx) {
+          orders.push({ side: 'buy', mint: best, quote_lamports: BigInt(P.probeLamports), max_slippage_bps: P.buySlippageBps });
+          probes.set(best, false);
         }
       }
       return orders;
